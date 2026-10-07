@@ -22,5 +22,16 @@ func ValidateRun(run Run) error {
 
 func CanAdvance(from, to RunState) bool {
 	transitions := map[RunState]RunState{Loading: Pumping, Pumping: Conditioning, Conditioning: Coating, Coating: Cooling, Cooling: Venting, Venting: Released}
-	return transitions[from] == to
+	if transitions[from] == to {
+		return true
+	}
+	// Recovery may bring an interrupted or failed run straight to cooling,
+	// but runs already cooling/venting/released cannot be recovered again.
+	if to == Cooling {
+		switch from {
+		case Loading, Pumping, Conditioning, Coating, Failed:
+			return true
+		}
+	}
+	return false
 }

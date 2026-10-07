@@ -22,6 +22,7 @@ type RecoveryReport struct {
 	RunID     model.ID         `json:"run_id"`
 	Actions   []RecoveryAction `json:"actions"`
 	Recovered bool             `json:"recovered"`
+	NextStep  string           `json:"next_step,omitempty"`
 	At        time.Time        `json:"at"`
 }
 
@@ -40,25 +41,58 @@ func (s *Service) Recover(ctx context.Context, runtime *Runtime, runID model.ID)
 	value, ok := s.Runs.Get(runID)
 	if !ok {
 		report = appendRecovery(report, "load_run", fmt.Errorf("run not found"))
+		report.NextStep = "verify the run id; no recovery action was taken"
 		return report
 	}
 	report = appendRecovery(report, "load_run", nil)
-	shutterErr := runtime.Shutter.Close(ctx)
-	report = appendRecovery(report, "close_shutter", shutterErr)
+
+	// Safety actions must all succeed, in order, before any state change.
+	// A failure aborts the transaction: the run keeps its current state so
+	// recovery can be retried once the hardware problem is resolved.
+	if shutterErr := runtime.Shutter.Close(ctx); shutterErr != nil {
+		report = appendRecovery(report, "close_shutter", shutterErr)
+		report.NextStep = "retry Recover after the shutter can be closed; source is still active"
+		runtime.Timeline.Add(runID, "recovery", "recovered=false failed=close_shutter")
+		return report
+	}
+	report = appendRecovery(report, "close_shutter", nil)
+
 	s.Source.Stop()
 	report = appendRecovery(report, "stop_source", nil)
-	cooldown := chamber.DefaultCooldownPolicy()
+
 	s.Chamber.SetSourcePower(0)
-	cooldownErr := cooldown.Wait(ctx, s.Chamber)
-	report = appendRecovery(report, "cool_chamber", cooldownErr)
+	if cooldownErr := chamber.DefaultCooldownPolicy().Wait(ctx, s.Chamber); cooldownErr != nil {
+		report = appendRecovery(report, "cool_chamber", cooldownErr)
+		report.NextStep = "retry Recover once cooling can complete (shutter is closed and source stopped)"
+		runtime.Timeline.Add(runID, "recovery", "recovered=false failed=cool_chamber")
+		return report
+	}
+	report = appendRecovery(report, "cool_chamber", nil)
+
+	// Audit must be durable before the run is promoted, otherwise an
+	// unrecoverable state could be entered with no recovery record.
 	incident := runtime.Incidents.Raise(runID, "warning", "run recovered to safe state")
-	journalErr := s.Journal.Append(journal.IncidentRaised(incident))
-	report = appendRecovery(report, "record_recovery", journalErr)
-	value.State = model.Cooling
-	s.Runs.Add(value)
+	if journalErr := s.Journal.Append(journal.IncidentRaised(incident)); journalErr != nil {
+		report = appendRecovery(report, "record_recovery", journalErr)
+		report.NextStep = "retry Recover to persist the recovery record; hardware is already safe (shutter closed, source stopped, chamber cooled)"
+		runtime.Timeline.Add(runID, "recovery", "recovered=false failed=record_recovery")
+		return report
+	}
+	report = appendRecovery(report, "record_recovery", nil)
+
+	// Commit: state transition is gated by the registry. It is the only
+	// place run.State is written, so a rejected transition cannot leave
+	// the run in cooling without a valid predecessor state.
+	if err := run.Advance(s.Runs, runID, model.Cooling); err != nil {
+		report = appendRecovery(report, "set_cooling", err)
+		report.NextStep = fmt.Sprintf("run is in state %s which cannot recover to cooling; investigate manually", value.State)
+		runtime.Timeline.Add(runID, "recovery", "recovered=false failed=set_cooling")
+		return report
+	}
 	report = appendRecovery(report, "set_cooling", nil)
-	report.Recovered = shutterErr == nil && cooldownErr == nil && journalErr == nil
-	runtime.Timeline.Add(runID, "recovery", fmt.Sprintf("recovered=%t", report.Recovered))
+	report.Recovered = true
+	report.NextStep = "run is cooling; proceed to venting and release"
+	runtime.Timeline.Add(runID, "recovery", "recovered=true")
 	return report
 }
 
